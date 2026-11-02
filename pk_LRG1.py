@@ -305,16 +305,21 @@ class FOLPSbAfTracerSpectrum2Poles(FOLPSTracerSpectrum2Poles):
     point, with f = fsigma8(z) / sigma8(z) of the current cosmology, so that a Gaussian prior on
     bA_f is a Gaussian prior on bA / f (whatever the prior basis). The bA parameter is then ignored.
     When bA_f is fixed, the theory is FOLPSTracerSpectrum2Poles, bA included.
+
+    The growth rate f = fsigma8(z) / sigma8(z) at the tracer redshift is output as a derived parameter
+    (e.g. LRG1.f), so it is saved in the chains.
     """
 
     @classmethod
     def propose_params(cls, tracers=None, **kwargs):
         vc = super().propose_params(tracers=tracers, **kwargs)
-        # one bA_f per bA, with the same namespace (the tracer)
+        # one bA_f and one derived f per bA, with the same namespace (the tracer)
         for param in list(vc):
             if param.basename == 'bA':
                 vc.set(Parameter('bA_f', value=0., fixed=True, prior={'dist': 'norm', 'loc': 0., 'scale': 0.1},
                                  ref={'dist': 'norm', 'loc': 0., 'scale': 0.01}, latex='b_A/f', namespace=param.namespace))
+                # derived output: its value is set in __call__, as CosmoprimoCosmology does for H0, sigma8_m, ...
+                vc.set(Parameter('f', value=0., derived=True, latex='f', namespace=param.namespace))
         return vc
 
     def _bA_norm(self):
@@ -328,10 +333,12 @@ class FOLPSbAfTracerSpectrum2Poles(FOLPSTracerSpectrum2Poles):
         return A  # 'tcm_chudaykin_aap'
 
     def __call__(self):
+        f = self.pt.fsigma8 / self.pt.sigma8
+        for param in (self.f if isinstance(self.f, tuple) else (self.f,)):
+            param.value = f  # derived parameter
         ratios = self.bA_f
         if all(param.fixed and not isinstance(param.derived, str) for param in (ratios if isinstance(ratios, tuple) else (ratios,))):
             return super().__call__()
-        f = self.pt.fsigma8 / self.pt.sigma8
         norm = self._bA_norm()
         to_bA = lambda param: _BAValue(param.value * f * norm)  # the parent divides by norm: folps' bA = bA_f * f
         bA = self.bA
