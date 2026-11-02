@@ -101,6 +101,13 @@ width_EFT = 12.5
 width_SN0 = 2.0
 width_SN2 = 5.0
 
+#Anisotropic bias: 'ratio' samples bA_f = bA / f (f the growth rate) with a Gaussian prior,
+#'bA' samples bA itself with a Gaussian prior, as before. bA here is folps' bA, in the tree-level
+#kernel b1 + f mu^2 + bA (mu^2 - 1/3); see FOLPSbAfTracerSpectrum2Poles below.
+bA_prior = 'ratio'
+bA_f_loc = 0.
+bA_f_scale = 0.1
+
 pt_model = "EFT"  #Choose b/w folpsD and EFT
 # pt_model = "folpsD"  #Choose b/w folpsD and EFT
 
@@ -169,6 +176,7 @@ chain_name = (
     f"_{'Afull' if A_full_status else 'Ano'}"
     f"_{'b3_coev' if b3_coev else 'b3_samp'}"
     f"{f'_damping_{damping}' if damping != 'lor' else ''}"
+    f"{'_bAf' if bA_prior == 'ratio' else ''}"
 )
 #desilike samplers now write one file per chain (samples_<i>.h5) into a directory,
 #which must not have a suffix (chain_name contains dots)
@@ -220,8 +228,11 @@ def make_params(prior_basis, width_EFT, width_SN0, width_SN2, sigma8_fid, pt_mod
         else:
             params['X_FoG'] = {'prior': {'dist':'uniform','limits': [0, 10]}}
 
-        # Anisotropic bias
-        params['bA'] = {'prior': {'dist': 'norm', 'loc': 0, 'scale': 0.1}}
+        # Anisotropic bias: Gaussian prior on bA / f (bA_f), or on bA itself
+        if bA_prior == 'ratio':
+            params['bA_f'] = {'prior': {'dist': 'norm', 'loc': bA_f_loc, 'scale': bA_f_scale}}
+        else:
+            params['bA'] = {'prior': {'dist': 'norm', 'loc': 0, 'scale': 0.1}}
 
 
 
@@ -259,8 +270,11 @@ def make_params(prior_basis, width_EFT, width_SN0, width_SN2, sigma8_fid, pt_mod
         params['c1'] = {'prior': {'dist': 'norm', 'loc': 66.6, 'scale': 66.6*4}}
         params['c2'] = {'prior': {'dist': 'norm', 'loc': 0, 'scale': 1*4}}
 
-        # Anisotropic bias
-        params['bA'] = {'prior': {'dist': 'norm', 'loc': 0, 'scale': 0.1}}
+        # Anisotropic bias: Gaussian prior on bA / f (bA_f), or on bA itself
+        if bA_prior == 'ratio':
+            params['bA_f'] = {'prior': {'dist': 'norm', 'loc': bA_f_loc, 'scale': bA_f_scale}}
+        else:
+            params['bA'] = {'prior': {'dist': 'norm', 'loc': 0, 'scale': 0.1}}
 
     if not hexa:
         # As desilike did before: alpha4 is fixed when the hexadecapole is not fitted
@@ -272,6 +286,60 @@ def make_params(prior_basis, width_EFT, width_SN0, width_SN2, sigma8_fid, pt_mod
             settings.setdefault('fixed', False)
 
     return params
+
+
+class _BAValue:
+    """Stand-in for the bA parameter, as read by FOLPSTracerSpectrum2Poles.__call__ (.value, .fixed, .derived)."""
+    fixed = False
+    derived = False
+
+    def __init__(self, value):
+        self.value = value
+
+
+class FOLPSbAfTracerSpectrum2Poles(FOLPSTracerSpectrum2Poles):
+    """FOLPSTracerSpectrum2Poles with the anisotropic bias sampled as the ratio bA_f = bA / f.
+
+    bA_f is a new parameter of each tracer (e.g. LRG1.bA_f), off (fixed at 0) by default as bA:
+    give it a prior to vary it. When it is varied, the theory sets folps' bA to bA_f * f at each
+    point, with f = fsigma8(z) / sigma8(z) of the current cosmology, so that a Gaussian prior on
+    bA_f is a Gaussian prior on bA / f (whatever the prior basis). The bA parameter is then ignored.
+    When bA_f is fixed, the theory is FOLPSTracerSpectrum2Poles, bA included.
+    """
+
+    @classmethod
+    def propose_params(cls, tracers=None, **kwargs):
+        vc = super().propose_params(tracers=tracers, **kwargs)
+        # one bA_f per bA, with the same namespace (the tracer)
+        for param in list(vc):
+            if param.basename == 'bA':
+                vc.set(Parameter('bA_f', value=0., fixed=True, prior={'dist': 'norm', 'loc': 0., 'scale': 0.1},
+                                 ref={'dist': 'norm', 'loc': 0., 'scale': 0.01}, latex='b_A/f', namespace=param.namespace))
+        return vc
+
+    def _bA_norm(self):
+        # normalisation by which FOLPSTracerSpectrum2Poles.__call__ divides the bA parameter
+        A = self.pt.sigma8 / self.pt.sigma8_fid
+        if self._prior_basis in ('physical', 'physical_aap'):
+            A_AP = 1. / (self.pt.qper**2 * self.pt.qpar) if self._prior_basis == 'physical_aap' else 1.
+            return A * A_AP**0.5
+        if self._prior_basis == 'standard':
+            return 1.
+        return A  # 'tcm_chudaykin_aap'
+
+    def __call__(self):
+        ratios = self.bA_f
+        if all(param.fixed and not isinstance(param.derived, str) for param in (ratios if isinstance(ratios, tuple) else (ratios,))):
+            return super().__call__()
+        f = self.pt.fsigma8 / self.pt.sigma8
+        norm = self._bA_norm()
+        to_bA = lambda param: _BAValue(param.value * f * norm)  # the parent divides by norm: folps' bA = bA_f * f
+        bA = self.bA
+        self.bA = tuple(map(to_bA, ratios)) if isinstance(ratios, tuple) else to_bA(ratios)
+        try:
+            return super().__call__()
+        finally:
+            self.bA = bA
 
 
 
@@ -380,7 +448,7 @@ for tracer in tracers:
     # (sigma8_fid and h_fid are no longer arguments: desilike reads them off the template's fiducial)
     sigma8_fids[tracer] = fiducial.get_fourier().sigma8_z(z, of='delta_cb')
     # PS theory; bias parameters are namespaced by tracer, e.g. LRG1.b1
-    ps_theory = FOLPSTracerSpectrum2Poles(template=template, prior_basis=prior_basis, A_full=A_full_status,
+    ps_theory = FOLPSbAfTracerSpectrum2Poles(template=template, prior_basis=prior_basis, A_full=A_full_status,
                                           damping=damping, tracers=tracer)
     # FOLPSTracerPowerSpectrumMultipoles (FOLPS v1) and the velocileptors theories are now
     # FOLPSTracerSpectrum2Poles, LPTVelocileptorsTracerSpectrum2Poles and REPTVelocileptorsTracerSpectrum2Poles
